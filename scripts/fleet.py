@@ -12,7 +12,8 @@ Usage:
     python3 fleet.py sync                              # Regenerate & upload subscription
 """
 
-import json, subprocess, sys, os, secrets, re, textwrap, time
+import base64, json, subprocess, sys, os, secrets, re, textwrap, time, ssl, shlex
+from urllib.parse import quote, urlencode
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -20,12 +21,6 @@ SKILL_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = SKILL_DIR / "config.json"
 EXAMPLE_CONFIG_PATH = SKILL_DIR / "config.example.json"
 RULES_DIR = SKILL_DIR / "templates" / "rules"
-
-# Pin the 3x-ui version the whole fleet runs on. The panel API client below
-# (login → session cookie → /panel/api/inbounds) handles both the 2.8.x API
-# and the CSRF-token login that 3.4.x added — see REMOTE_INBOUND_SCRIPT. When
-# bumping, re-verify that login flow still holds against the new release.
-XUI_VERSION = "v3.4.1"
 
 # ── Helpers ──────────────────────────────────────────────────
 
@@ -141,9 +136,9 @@ def install_3xui(host, creds):
     if installed:
         print(f"  [{host}] 3x-ui already installed, skipping install")
     else:
-        print(f"  [{host}] Installing 3x-ui {XUI_VERSION} (this may take 1-2 minutes)...")
+        print(f"  [{host}] Installing 3x-ui (this may take 1-2 minutes)...")
         ssh(host,
-            f"echo 'y' | bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/{XUI_VERSION}/install.sh) {XUI_VERSION}",
+            "echo 'y' | bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh)",
             timeout=180, check=False)
         print(f"  [{host}] Install complete")
 
@@ -161,7 +156,7 @@ def install_3xui(host, creds):
 # ── VLESS+Reality Inbound ────────────────────────────────────
 
 REMOTE_INBOUND_SCRIPT = textwrap.dedent(r'''
-import json, subprocess, sys, re, urllib.request, urllib.parse, http.cookiejar, secrets, glob
+import json, subprocess, sys, urllib.request, urllib.parse, http.cookiejar, secrets, glob, ssl
 
 port = int(sys.argv[1])
 remark = sys.argv[2]
@@ -175,8 +170,7 @@ candidates = glob.glob("/usr/local/x-ui/bin/xray-linux-*")
 XRAY = candidates[0] if candidates else "/usr/local/x-ui/bin/xray-linux-amd64"
 
 # Generate x25519 keys
-# Xray v26+:  "PrivateKey: ... / Password: ... / Hash32: ..."
-# Xray v26.x: "PrivateKey: ... / Password (PublicKey): ... / Hash32: ..."
+# Xray v26+: "PrivateKey: ... / Password: ... / Hash32: ..."
 # Xray older: "Private key: ... / Public key: ..."
 keys_out = subprocess.check_output([XRAY, "x25519"]).decode()
 kv = {}
@@ -186,13 +180,8 @@ for l in keys_out.strip().splitlines():
         kv[k.strip()] = v.strip()
 
 priv = kv.get("PrivateKey") or kv.get("Private key", "")
-# Public-key field label varies by Xray version: "Password",
-# "Password (PublicKey)" (v26+), or "Public key" (older). Match by prefix.
-pub = next(
-    (v for k, v in kv.items()
-     if k.startswith("Password") or k.lower().startswith("public key")),
-    "",
-)
+pub = (kv.get("Password") or kv.get("Password (PublicKey)")
+       or kv.get("Public key", ""))
 
 if not priv or not pub:
     print(json.dumps({"success": False, "error": f"Failed to parse x25519 output: {kv}"}))
@@ -201,52 +190,72 @@ if not priv or not pub:
 uuid = subprocess.check_output([XRAY, "uuid"]).decode().strip()
 sid = secrets.token_hex(4)
 
-# Login. 3x-ui 3.4.x guards POSTs with a CSRF token embedded in the login
-# page (<meta name="csrf-token">) and paired with the session cookie; 2.8.x
-# has neither. Fetch "/" first, then send the token as X-CSRF-Token on every
-# request (omitted when absent, so the same flow works on both versions).
-panel = f"http://localhost:{panel_port}"
-cj = http.cookiejar.CookieJar()
-opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+# Login — support legacy form login and CSRF-protected 3x-ui 3.x panels.
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+panel = None
+opener = None
+for proto in ["https", "http"]:
+    cj = http.cookiejar.CookieJar()
+    if proto == "https":
+        candidate = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
+    else:
+        candidate = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    base = f"{proto}://localhost:{panel_port}"
+    try:
+        token = ""
+        try:
+            csrf_resp = candidate.open(f"{base}/csrf-token", timeout=5)
+            token = json.loads(csrf_resp.read()).get("obj", "")
+        except Exception:
+            pass
+        payload = json.dumps({"username": username, "password": password}).encode()
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if token:
+            headers["X-CSRF-Token"] = token
+        login_req = urllib.request.Request(f"{base}/login", payload, headers)
+        candidate.open(login_req, timeout=5)
+        panel, opener = base, candidate
+        break
+    except Exception:
+        try:
+            legacy = urllib.parse.urlencode(
+                {"username": username, "password": password}
+            ).encode()
+            candidate.open(f"{base}/login", legacy, timeout=5)
+            panel, opener = base, candidate
+            break
+        except Exception:
+            continue
 
-home = opener.open(f"{panel}/").read().decode("utf-8", "replace")
-m = re.search(r'name="csrf-token"\s+content="([^"]+)"', home)
-csrf = m.group(1) if m else ""
+if not panel or not opener:
+    raise RuntimeError("Unable to log in to 3x-ui panel")
 
-def api(path, data=None, json_body=False):
-    headers = {}
-    if csrf:
-        headers["X-CSRF-Token"] = csrf
-    if json_body:
-        headers["Content-Type"] = "application/json"
-    return urllib.request.Request(f"{panel}{path}", data, headers)
-
-opener.open(api("/login",
-    urllib.parse.urlencode({"username": username, "password": password}).encode()))
-
-# Delete existing VLESS inbounds to avoid duplicates. del/ is a POST route
-# (3.4.x returns 404 for GET) — pass an empty body to force the POST method.
-existing = json.loads(opener.open(api("/panel/api/inbounds/list")).read())
+# Delete existing VLESS inbounds to avoid duplicates
+req = urllib.request.Request(f"{panel}/panel/api/inbounds/list")
+resp = opener.open(req)
+existing = json.loads(resp.read())
 for ib in existing.get("obj", []):
     if ib.get("protocol") == "vless":
-        opener.open(api(f"/panel/api/inbounds/del/{ib['id']}", b""))
+        delete_headers = {}
+        if token:
+            delete_headers["X-CSRF-Token"] = token
+        dreq = urllib.request.Request(
+            f"{panel}/panel/api/inbounds/del/{ib['id']}",
+            headers=delete_headers,
+        )
+        opener.open(dreq)
 
-# 3x-ui 3.4.x stores clients in dedicated tables (clients/client_inbounds) and
-# requires a non-empty, unique email — a client with email "" is silently
-# dropped from the generated xray config (clients: null → all handshakes fail).
-# 2.8.x tolerated empty email, so this stays compatible with both.
 settings = json.dumps({
-    "clients": [{"id": uuid, "flow": "xtls-rprx-vision",
-                 "email": f"{remark}-{secrets.token_hex(3)}",
+    "clients": [{"id": uuid, "flow": "xtls-rprx-vision", "email": f"vless-{port}",
                  "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True,
-                 "tgId": "", "subId": secrets.token_hex(8), "reset": 0}],
+                 "tgId": 0, "subId": "", "reset": 0}],
     "decryption": "none", "fallbacks": []
 })
-# NOTE on the Reality dest (= defaults.sni): pick a TLS-1.3 site whose
-# Certificate record fits Xray's hardcoded 8192-byte limit. www.microsoft.com
-# now returns an ~8273-byte cert and fails with "handshake did not complete
-# successfully" on xray-core 26.x (XTLS/Xray-core#6356) — use apple/cloudflare/
-# bing/icloud instead. Verify a new dest before switching the fleet to it.
 stream = json.dumps({
     "network": "tcp", "security": "reality", "externalProxy": [],
     "realitySettings": {
@@ -266,7 +275,12 @@ body = json.dumps({
     "settings": settings, "streamSettings": stream, "sniffing": sniffing
 }).encode()
 
-result = json.loads(opener.open(api("/panel/api/inbounds/add", body, json_body=True)).read())
+mutation_headers = {"Content-Type": "application/json"}
+if token:
+    mutation_headers["X-CSRF-Token"] = token
+req = urllib.request.Request(f"{panel}/panel/api/inbounds/add", body, mutation_headers)
+resp = opener.open(req)
+result = json.loads(resp.read())
 
 print(json.dumps({
     "success": result.get("success", False),
@@ -278,49 +292,107 @@ def create_inbound(host, port, remark, cfg):
     """Create VLESS+Reality inbound on remote host. Returns node info dict."""
     creds = cfg["credentials"]
     defaults = cfg["defaults"]
-    args = f"{port} {remark} {creds['panel_port']} {creds['username']} {creds['password']} {defaults['sni']}"
+    args = build_inbound_args(
+        port=port,
+        remark=remark,
+        panel_port=creds["panel_port"],
+        username=creds["username"],
+        password=creds["password"],
+        sni=defaults["sni"],
+    )
     out = ssh_script(host, REMOTE_INBOUND_SCRIPT, args, timeout=30)
     result = json.loads(out)
     if not result.get("success"):
-        raise RuntimeError(f"[{host}] Failed to create inbound: {result.get('error', 'unknown')}")
+        raise RuntimeError(
+            f"[{host}] Failed to create inbound: "
+            f"{result.get('error') or result.get('msg') or 'unknown'}"
+        )
     print(f"  [{host}] VLESS+Reality on port {port} — UUID: {result['uuid'][:8]}...")
     return result
+
+
+def build_inbound_args(port, remark, panel_port, username, password, sni):
+    """Build shell-safe argv for the remote inbound creation script."""
+    return shlex.join([
+        str(port),
+        str(remark),
+        str(panel_port),
+        str(username),
+        str(password),
+        str(sni),
+    ])
 
 # ── Remote Query ─────────────────────────────────────────────
 
 REMOTE_QUERY_SCRIPT = textwrap.dedent(r'''
-import json, urllib.request, urllib.parse, http.cookiejar, subprocess, sys, glob, re
+import json, urllib.request, urllib.parse, http.cookiejar, subprocess, sys, glob, ssl
 
 panel_port = int(sys.argv[1])
 username = sys.argv[2]
 password = sys.argv[3]
 
-panel = f"http://localhost:{panel_port}"
-cj = http.cookiejar.CookieJar()
-opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+# Detect protocol and support both legacy and CSRF-protected 3x-ui login flows.
+panel = None
+opener = None
+for proto in ["https", "http"]:
+    cj = http.cookiejar.CookieJar()
+    if proto == "https":
+        candidate = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
+    else:
+        candidate = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    base = f"{proto}://localhost:{panel_port}"
+    try:
+        token = ""
+        try:
+            csrf_resp = candidate.open(f"{base}/csrf-token", timeout=5)
+            token = json.loads(csrf_resp.read()).get("obj", "")
+        except Exception:
+            pass
+        payload = json.dumps({"username": username, "password": password}).encode()
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if token:
+            headers["X-CSRF-Token"] = token
+        candidate.open(urllib.request.Request(f"{base}/login", payload, headers), timeout=5)
+        panel, opener = base, candidate
+        break
+    except Exception:
+        try:
+            legacy = urllib.parse.urlencode(
+                {"username": username, "password": password}
+            ).encode()
+            candidate.open(f"{base}/login", legacy, timeout=5)
+            panel, opener = base, candidate
+            break
+        except Exception:
+            continue
+
+if not panel:
+    print(json.dumps({"inbounds": []}))
+    sys.exit(0)
 
 inbounds = []
 xver = "?"
 
+def json_object(value):
+    """Normalize legacy JSON strings and newer 3x-ui object fields."""
+    if isinstance(value, str):
+        return json.loads(value or "{}")
+    return value or {}
+
 try:
-    # 3.4.x: grab the CSRF token from the login page and send it as a header
-    # (paired with the session cookie). 2.8.x has no token, so hdr stays empty.
-    home = opener.open(f"{panel}/").read().decode("utf-8", "replace")
-    m = re.search(r'name="csrf-token"\s+content="([^"]+)"', home)
-    hdr = {"X-CSRF-Token": m.group(1)} if m else {}
-    opener.open(urllib.request.Request(f"{panel}/login",
-        urllib.parse.urlencode({"username": username, "password": password}).encode(), hdr))
-    resp = opener.open(urllib.request.Request(f"{panel}/panel/api/inbounds/list", headers=hdr))
+    resp = opener.open(f"{panel}/panel/api/inbounds/list")
     data = json.loads(resp.read())
 
-    # 2.8.x returns streamSettings/settings as JSON strings; 3.4.x returns
-    # them as already-parsed objects. Accept either.
-    def _obj(v):
-        return v if isinstance(v, dict) else json.loads(v or "{}")
-
     for ib in data.get("obj", []):
-        stream = _obj(ib.get("streamSettings"))
-        settings = _obj(ib.get("settings"))
+        stream = json_object(ib.get("streamSettings", {}))
+        settings = json_object(ib.get("settings", {}))
         reality = stream.get("realitySettings", {})
         clients = settings.get("clients", [])
         inbounds.append({
@@ -329,16 +401,43 @@ try:
             "up": ib.get("up", 0), "down": ib.get("down", 0),
             "uuid": clients[0]["id"] if clients else "",
             "public_key": reality.get("settings", {}).get("publicKey", ""),
+            "private_key": reality.get("privateKey", ""),
             "short_id": (reality.get("shortIds", [""]))[0] if reality.get("shortIds") else "",
             "sni": (reality.get("serverNames", [""]))[0] if reality.get("serverNames") else "",
         })
 
-    # Detect xray binary and version
-    candidates = glob.glob("/usr/local/x-ui/bin/xray-linux-*")
-    if candidates:
+    # Detect xray binary and version (native install + Docker)
+    xray_bin = None
+    for candidate in glob.glob("/usr/local/x-ui/bin/xray-linux-*"):
+        xray_bin = candidate
+        break
+    if not xray_bin:
+        # Try Docker 3x-ui container
+        try:
+            r = subprocess.run(["docker", "exec", "3x-ui", "which", "xray"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                xray_bin = f"docker exec 3x-ui {r.stdout.strip()}"
+        except Exception:
+            pass
+    if xray_bin and "docker exec" not in str(xray_bin):
         xver = subprocess.check_output(
-            [candidates[0], "version"], stderr=subprocess.STDOUT
+            [xray_bin, "version"], stderr=subprocess.STDOUT
         ).decode().split()[1]
+        # Derive public key from private key if missing (Docker 3x-ui)
+        for ib in inbounds:
+            if not ib["public_key"] and ib["private_key"]:
+                try:
+                    out = subprocess.check_output(
+                        [xray_bin, "x25519", "-i", ib["private_key"]],
+                        stderr=subprocess.STDOUT
+                    ).decode()
+                    for line in out.splitlines():
+                        if "PublicKey" in line:
+                            ib["public_key"] = line.split(":", 1)[1].strip()
+                            break
+                except Exception:
+                    pass
 except Exception as e:
     pass
 
@@ -346,18 +445,70 @@ print(json.dumps({"inbounds": inbounds, "xray_version": xver}))
 ''')
 
 def query_node(host, cfg):
-    """Query a node's 3x-ui API for inbound details."""
+    """Query a node's 3x-ui API with legacy/CSRF login compatibility."""
     creds = cfg["credentials"]
-    args = f"{creds['panel_port']} {creds['username']} {creds['password']}"
+    panel_port = creds["panel_port"]
+    # Check for per-node panel_port override (e.g. Docker install)
+    for n in cfg.get("nodes", []):
+        if n["ssh_host"] == host and "panel_port" in n:
+            panel_port = n["panel_port"]
+            break
+
+    args = shlex.join([
+        str(panel_port),
+        str(creds["username"]),
+        str(creds["password"]),
+    ])
     try:
-        out = ssh_script(host, REMOTE_QUERY_SCRIPT, args, timeout=15)
-        return json.loads(out)
+        out = ssh_script(host, REMOTE_QUERY_SCRIPT, args, timeout=30)
+        data = json.loads(out)
+        return data if isinstance(data, dict) else {"inbounds": []}
+    except json.JSONDecodeError:
+        return {"error": "invalid JSON response", "inbounds": []}
     except Exception as e:
         return {"error": str(e), "inbounds": []}
 
+
+def format_query_result(host, node_details):
+    """Render query failures explicitly instead of treating them as empty nodes."""
+    if node_details.get("error"):
+        return f"  [{host}] ❌ Query failed: {node_details['error']}"
+    return f"  [{host}] {len(node_details.get('inbounds', []))} inbound(s)"
+
+
+def _derive_public_key(host, private_key):
+    """Derive X25519 public key from private key using remote xray."""
+    # Try native xray first
+    try:
+        out = ssh(host,
+            f'for b in /usr/local/x-ui/bin/xray-linux-*; do '
+            f'  [ -f "$b" ] && out=$("$b" x25519 -i "{private_key}" 2>/dev/null) && '
+            f'  echo "$out" && break; '
+            f'done',
+            timeout=10, check=False)
+        if out:
+            for line in out.splitlines():
+                if "PublicKey" in line:
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    # Try Docker 3x-ui
+    try:
+        out = ssh(host,
+            f'docker exec 3x-ui sh -c \'xray x25519 -i "{private_key}"\' 2>/dev/null || '
+            f'docker exec 3x-ui sh -c \'for b in /usr/local/x-ui/bin/xray-linux-*; do [ -f "$b" ] && "$b" x25519 -i "{private_key}"; break; done\' 2>/dev/null',
+            timeout=10, check=False)
+        if out:
+            for line in out.splitlines():
+                if "PublicKey" in line:
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
 # ── Verify ───────────────────────────────────────────────────
 
-def verify_port(server, port, timeout=10):
+def verify_port(server, port, timeout=5):
     """Check if a port is reachable from local machine."""
     r = subprocess.run(
         ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
@@ -370,24 +521,9 @@ def verify_port(server, port, timeout=10):
 # ── Subscription Generator ───────────────────────────────────
 
 def load_rules():
-    """Load rule templates and compose whitelist-mode rule list.
+    """Load inline rules and compose the whitelist-mode provider chain."""
 
-    Rule priority (top = highest):
-      1. AI services (inline)        → 🤖 AI Services
-      2. Applications (rule-provider)→ DIRECT
-      3. Reject ads (rule-provider)  → REJECT
-      4. Custom direct (inline)      → DIRECT  (China AI, .cn, etc.)
-      5. Telegram CIDRs (provider)   → 🚀 Proxy
-      6. Private domains (provider)  → DIRECT
-      7. Apple (provider)            → DIRECT
-      8. iCloud (provider)           → DIRECT
-      9. China domains (provider)    → DIRECT
-     10. China CIDRs (provider)      → DIRECT
-     11. LAN CIDRs (provider)        → DIRECT
-     12. GEOIP CN                    → DIRECT
-     13. MATCH                       → 🐟 Final (default proxy)
-    """
-    def _load_inline(name):
+    def load_inline(name):
         lines = []
         path = RULES_DIR / f"{name}.yaml"
         if path.exists():
@@ -397,29 +533,23 @@ def load_rules():
                     lines.append(line)
         return lines
 
-    rules = []
-
-    # Inline rules (manually curated, highest priority)
-    rules += _load_inline("ai")
-
-    # Rule-provider references (Loyalsoldier/clash-rules, auto-updating)
-    rules.append("- RULE-SET,applications,DIRECT")
-    rules.append("- RULE-SET,reject,REJECT")
-
-    # Custom direct rules (China AI services, .cn TLD, etc.)
-    rules += _load_inline("direct")
-
-    # Remote rule-provider references (continued)
-    rules.append("- RULE-SET,telegramcidr,🚀 Proxy,no-resolve")
-    rules.append("- RULE-SET,private,DIRECT")
-    rules.append("- RULE-SET,apple,DIRECT")
-    rules.append("- RULE-SET,icloud,DIRECT")
-    rules.append("- RULE-SET,direct,DIRECT")
-    rules.append("- RULE-SET,cncidr,DIRECT,no-resolve")
-    rules.append("- RULE-SET,lancidr,DIRECT,no-resolve")
-    rules.append("- GEOIP,CN,DIRECT")
+    rules = load_inline("ai")
+    rules.extend([
+        "- RULE-SET,applications,DIRECT",
+        "- RULE-SET,reject,REJECT",
+    ])
+    rules.extend(load_inline("direct"))
+    rules.extend([
+        "- RULE-SET,telegramcidr,🚀 Proxy,no-resolve",
+        "- RULE-SET,private,DIRECT",
+        "- RULE-SET,apple,DIRECT",
+        "- RULE-SET,icloud,DIRECT",
+        "- RULE-SET,direct,DIRECT",
+        "- RULE-SET,cncidr,DIRECT,no-resolve",
+        "- RULE-SET,lancidr,DIRECT,no-resolve",
+        "- GEOIP,CN,DIRECT",
+    ])
     rules.append("- MATCH,🐟 Final")
-
     return rules
 
 def generate_subscription(cfg, node_details):
@@ -564,27 +694,26 @@ def generate_subscription(cfg, node_details):
     lines.append("      - DIRECT")
     lines.append("")
 
-    # Rule providers (Loyalsoldier/clash-rules — auto-updates daily)
     lines.append("rule-providers:")
-    _providers = [
-        ("reject",       "domain",    "reject.txt"),
-        ("private",      "domain",    "private.txt"),
-        ("apple",        "domain",    "apple.txt"),
-        ("icloud",       "domain",    "icloud.txt"),
-        ("direct",       "domain",    "direct.txt"),
+    providers = [
+        ("reject", "domain", "reject.txt"),
+        ("private", "domain", "private.txt"),
+        ("apple", "domain", "apple.txt"),
+        ("icloud", "domain", "icloud.txt"),
+        ("direct", "domain", "direct.txt"),
         ("applications", "classical", "applications.txt"),
-        ("cncidr",       "ipcidr",    "cncidr.txt"),
-        ("lancidr",      "ipcidr",    "lancidr.txt"),
-        ("telegramcidr", "ipcidr",    "telegramcidr.txt"),
+        ("cncidr", "ipcidr", "cncidr.txt"),
+        ("lancidr", "ipcidr", "lancidr.txt"),
+        ("telegramcidr", "ipcidr", "telegramcidr.txt"),
     ]
-    _base = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release"
-    for pname, behavior, filename in _providers:
-        lines.append(f"  {pname}:")
-        lines.append(f"    type: http")
+    provider_base = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release"
+    for name, behavior, filename in providers:
+        lines.append(f"  {name}:")
+        lines.append("    type: http")
         lines.append(f"    behavior: {behavior}")
-        lines.append(f'    url: "{_base}/{filename}"')
-        lines.append(f"    path: ./ruleset/{pname}.yaml")
-        lines.append(f"    interval: 86400")
+        lines.append(f'    url: "{provider_base}/{filename}"')
+        lines.append(f"    path: ./ruleset/{name}.yaml")
+        lines.append("    interval: 86400")
     lines.append("")
 
     lines.append("rules:")
@@ -592,6 +721,54 @@ def generate_subscription(cfg, node_details):
         lines.append(f"  {r}")
 
     return "\n".join(lines) + "\n"
+
+
+def generate_vless_subscription(cfg, node_details):
+    """Generate the base64 VLESS URI list used by Loon/V2rayN clients."""
+    defaults = cfg["defaults"]
+    lines = []
+    for node in cfg["nodes"]:
+        nd = node_details.get(node["ssh_host"], {})
+        vless_ib = next(
+            (ib for ib in nd.get("inbounds", []) if ib["protocol"] == "vless"),
+            None,
+        )
+        if not vless_ib:
+            continue
+        name = f"{node['emoji']} {node['name']}"
+        params = urlencode({
+            "encryption": "none",
+            "flow": "xtls-rprx-vision",
+            "security": "reality",
+            "sni": vless_ib.get("sni") or defaults["sni"],
+            "fp": defaults["fingerprint"],
+            "pbk": vless_ib["public_key"],
+            "sid": vless_ib["short_id"],
+            "type": "tcp",
+        })
+        lines.append(
+            f"vless://{vless_ib['uuid']}@{node['server']}:{node['port']}"
+            f"?{params}#{quote(name)}"
+        )
+    return base64.b64encode("\n".join(lines).encode()).decode()
+
+
+def subscription_url(cfg, filename):
+    """Return the token-protected public URL for a subscription file."""
+    sub = cfg["subscription"]
+    return f"https://{sub['domain']}{sub['url_path'].rstrip('/')}/{filename}"
+
+
+def upload_subscription_file(sub, filename, content):
+    """Upload one subscription artifact without exposing its content in logs."""
+    remote_path = f"{sub['file_path'].rstrip('/')}/{filename}"
+    command = f"mkdir -p {shlex.quote(sub['file_path'])} && cat > {shlex.quote(remote_path)}"
+    return subprocess.run(
+        ["ssh", sub["ssh_host"], command],
+        input=content,
+        capture_output=True,
+        text=True,
+    )
 
 # ── Commands ─────────────────────────────────────────────────
 
@@ -700,8 +877,8 @@ def cmd_status():
             name = f"{node['emoji']} {node['name']}"
             print(f"{name:<20} {node['server']:<20} {node['port']:>6}  {status:<16} {traffic:>12}")
 
-    sub = cfg["subscription"]
-    print(f"\n📋 Subscription: https://{sub['domain']}/{sub['url_path']}/config.yaml")
+    print(f"\n📋 Clash/Mihomo: {subscription_url(cfg, 'config.yaml')}")
+    print(f"   Loon/V2rayN: {subscription_url(cfg, 'vless.txt')}")
     print(f"   Hosted on: {sub['ssh_host']} ({sub['file_path']})\n")
 
 def cmd_deploy(hosts, nat_range=None, name_override=None, emoji_override=None):
@@ -810,21 +987,23 @@ def cmd_sync():
         print("No nodes to sync.")
         return
 
-    print("Querying all nodes...")
+    print("Querying all nodes (sequential, with delays to avoid rate limiting)...")
     node_details = {}
-    with ThreadPoolExecutor(max_workers=len(nodes)) as pool:
-        future_map = {pool.submit(query_node, n["ssh_host"], cfg): n for n in nodes}
-        for f in as_completed(future_map):
-            node = future_map[f]
-            try:
-                nd = f.result()
-                node_details[node["ssh_host"]] = nd
-                ib_count = len(nd.get("inbounds", []))
-                print(f"  [{node['ssh_host']}] {ib_count} inbound(s)")
-            except Exception as e:
-                print(f"  [{node['ssh_host']}] ❌ Query failed: {e}")
+    for i, node in enumerate(nodes):
+        host = node["ssh_host"]
+        if i > 0:
+            time.sleep(20)  # Oracle Cloud SSHD rate limiting avoidance
+        try:
+            nd = query_node(host, cfg)
+            if not isinstance(nd, dict):
+                nd = {"error": "unexpected response", "inbounds": []}
+            node_details[host] = nd
+            print(format_query_result(host, nd))
+        except Exception as e:
+            print(f"  [{host}] ❌ Query failed: {e}")
 
     yaml_content = generate_subscription(cfg, node_details)
+    vless_content = generate_vless_subscription(cfg, node_details)
     if not yaml_content:
         print("❌ No subscription content generated.")
         return
@@ -834,15 +1013,17 @@ def cmd_sync():
 
     # Upload
     sub = cfg["subscription"]
-    r = subprocess.run(
-        ["ssh", sub["ssh_host"], f"mkdir -p {sub['file_path']} && cat > {sub['file_path']}/config.yaml"],
-        input=yaml_content, capture_output=True, text=True
-    )
-    if r.returncode == 0:
-        print(f"✅ Uploaded to {sub['ssh_host']}:{sub['file_path']}/config.yaml")
-        print(f"📋 https://{sub['domain']}/{sub['url_path']}/config.yaml")
-    else:
-        print(f"❌ Upload failed: {r.stderr}")
+    yaml_result = upload_subscription_file(sub, "config.yaml", yaml_content)
+    if yaml_result.returncode != 0:
+        print(f"❌ config.yaml upload failed: {yaml_result.stderr}")
+        return
+    vless_result = upload_subscription_file(sub, "vless.txt", vless_content)
+    if vless_result.returncode != 0:
+        print(f"❌ vless.txt upload failed: {vless_result.stderr}")
+        return
+    print(f"✅ Uploaded config.yaml and vless.txt to {sub['ssh_host']}:{sub['file_path']}")
+    print(f"📋 Clash/Mihomo: {subscription_url(cfg, 'config.yaml')}")
+    print(f"   Loon/V2rayN: {subscription_url(cfg, 'vless.txt')}")
 
 # ── Main ─────────────────────────────────────────────────────
 
