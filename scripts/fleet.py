@@ -12,7 +12,18 @@ Usage:
     python3 fleet.py sync                              # Regenerate & upload subscription
 """
 
-import base64, json, subprocess, sys, os, secrets, re, textwrap, time, ssl, shlex
+import base64
+import json
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from getpass import getpass
 from urllib.parse import quote, urlencode
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,6 +32,9 @@ SKILL_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = SKILL_DIR / "config.json"
 EXAMPLE_CONFIG_PATH = SKILL_DIR / "config.example.json"
 RULES_DIR = SKILL_DIR / "templates" / "rules"
+SSH_STRICT_HOST_KEY_CHECKING = os.environ.get(
+    "FLEET_STRICT_HOST_KEY_CHECKING", "accept-new"
+)
 
 # ── Helpers ──────────────────────────────────────────────────
 
@@ -32,14 +46,36 @@ def load_config():
         return json.load(f)
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-    print(f"  Config saved.")
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{CONFIG_PATH.name}.", dir=str(CONFIG_PATH.parent)
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(temporary_name, CONFIG_PATH)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+    print("  Config saved.")
+
+
+def ssh_args(host, *remote_args):
+    """Build SSH argv with host identity verification enabled by default."""
+    return [
+        "ssh",
+        "-o", "ConnectTimeout=10",
+        "-o", f"StrictHostKeyChecking={SSH_STRICT_HOST_KEY_CHECKING}",
+        host,
+        *remote_args,
+    ]
 
 def ssh(host, cmd, timeout=30, check=True):
     """Run a command on remote host via SSH."""
     r = subprocess.run(
-        ["ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no", host, cmd],
+        ssh_args(host, cmd),
         capture_output=True, text=True, timeout=timeout
     )
     if check and r.returncode != 0:
@@ -50,7 +86,7 @@ def ssh_script(host, script_text, args="", timeout=60):
     """Pipe a Python script to the remote host via SSH stdin."""
     cmd = f"python3 - {args}" if args else "python3 -"
     r = subprocess.run(
-        ["ssh", "-o", "ConnectTimeout=10", host, cmd],
+        ssh_args(host, cmd),
         input=script_text, capture_output=True, text=True, timeout=timeout
     )
     if r.returncode != 0:
@@ -143,13 +179,14 @@ def install_3xui(host, creds):
         print(f"  [{host}] Install complete")
 
     # Always reset credentials to ensure consistency
-    ssh(host, (
-        f"/usr/local/x-ui/x-ui setting "
-        f"-username {creds['username']} "
-        f"-password {creds['password']} "
-        f"-port {creds['panel_port']} "
-        f"-webBasePath /"
-    ))
+    setting_command = shlex.join([
+        "/usr/local/x-ui/x-ui", "setting",
+        "-username", str(creds["username"]),
+        "-password", str(creds["password"]),
+        "-port", str(creds["panel_port"]),
+        "-webBasePath", "/",
+    ])
+    ssh(host, setting_command)
     ssh(host, "systemctl restart x-ui")
     print(f"  [{host}] Credentials set (panel port {creds['panel_port']})")
 
@@ -184,7 +221,7 @@ pub = (kv.get("Password") or kv.get("Password (PublicKey)")
        or kv.get("Public key", ""))
 
 if not priv or not pub:
-    print(json.dumps({"success": False, "error": f"Failed to parse x25519 output: {kv}"}))
+    print(json.dumps({"success": False, "error": "Failed to parse x25519 output"}))
     sys.exit(0)
 
 uuid = subprocess.check_output([XRAY, "uuid"]).decode().strip()
@@ -235,12 +272,17 @@ for proto in ["https", "http"]:
 if not panel or not opener:
     raise RuntimeError("Unable to log in to 3x-ui panel")
 
-# Delete existing VLESS inbounds to avoid duplicates
+# Replace only the same managed inbound; never delete unrelated VLESS inbounds.
 req = urllib.request.Request(f"{panel}/panel/api/inbounds/list")
 resp = opener.open(req)
 existing = json.loads(resp.read())
 for ib in existing.get("obj", []):
-    if ib.get("protocol") == "vless":
+    if ib.get("protocol") != "vless":
+        continue
+    if str(ib.get("port")) == str(port) and ib.get("remark") != remark:
+        print(json.dumps({"success": False, "error": f"VLESS port {port} is already in use"}))
+        sys.exit(0)
+    if ib.get("remark") == remark:
         delete_headers = {}
         if token:
             delete_headers["X-CSRF-Token"] = token
@@ -440,6 +482,9 @@ try:
                     pass
 except Exception as e:
     pass
+
+for ib in inbounds:
+    ib.pop("private_key", None)
 
 print(json.dumps({"inbounds": inbounds, "xray_version": xver}))
 ''')
@@ -665,7 +710,7 @@ def generate_subscription(cfg, node_details):
         lines.append(f'    udp: {str(p["udp"]).lower()}')
         lines.append(f'    flow: {p["flow"]}')
         lines.append(f'    servername: {p["servername"]}')
-        lines.append(f'    reality-opts:')
+        lines.append("    reality-opts:")
         lines.append(f'      public-key: {p["reality-opts"]["public-key"]}')
         lines.append(f'      short-id: {p["reality-opts"]["short-id"]}')
         lines.append(f'    client-fingerprint: {p["client-fingerprint"]}')
@@ -764,10 +809,11 @@ def upload_subscription_file(sub, filename, content):
     remote_path = f"{sub['file_path'].rstrip('/')}/{filename}"
     command = f"mkdir -p {shlex.quote(sub['file_path'])} && cat > {shlex.quote(remote_path)}"
     return subprocess.run(
-        ["ssh", sub["ssh_host"], command],
+        ssh_args(sub["ssh_host"], command),
         input=content,
         capture_output=True,
         text=True,
+        timeout=30,
     )
 
 # ── Commands ─────────────────────────────────────────────────
@@ -784,7 +830,7 @@ def cmd_init():
 
     # Credentials
     username = input("Panel username [admin]: ").strip() or "admin"
-    password = input("Panel password (leave empty to auto-generate): ").strip()
+    password = getpass("Panel password (leave empty to auto-generate): ").strip()
     if not password:
         password = secrets.token_urlsafe(16)
         print(f"  Generated password: {password}")
@@ -840,8 +886,8 @@ def cmd_init():
     }
 
     save_config(cfg)
-    print(f"\n✅ Config created. Next steps:")
-    print(f"  1. Deploy nodes:  python3 scripts/fleet.py deploy <ssh-host>")
+    print("\n✅ Config created. Next steps:")
+    print("  1. Deploy nodes:  python3 scripts/fleet.py deploy <ssh-host>")
     print(f"  2. Set up nginx on {sub_host} with your SSL cert")
     print(f"  3. Point DNS: {domain} → your hosting server IP")
 
@@ -877,6 +923,7 @@ def cmd_status():
             name = f"{node['emoji']} {node['name']}"
             print(f"{name:<20} {node['server']:<20} {node['port']:>6}  {status:<16} {traffic:>12}")
 
+    sub = cfg["subscription"]
     print(f"\n📋 Clash/Mihomo: {subscription_url(cfg, 'config.yaml')}")
     print(f"   Loon/V2rayN: {subscription_url(cfg, 'vless.txt')}")
     print(f"   Hosted on: {sub['ssh_host']} ({sub['file_path']})\n")
@@ -922,7 +969,7 @@ def cmd_deploy(hosts, nat_range=None, name_override=None, emoji_override=None):
         server = host_info["hostname"]
         remark = name_override or host.replace(".", "-").replace(" ", "-")
         try:
-            result = create_inbound(host, port, remark, cfg)
+            create_inbound(host, port, remark, cfg)
         except Exception as e:
             print(f"  [{host}] ❌ Inbound creation failed: {e}")
             continue
@@ -989,6 +1036,7 @@ def cmd_sync():
 
     print("Querying all nodes (sequential, with delays to avoid rate limiting)...")
     node_details = {}
+    failures = []
     for i, node in enumerate(nodes):
         host = node["ssh_host"]
         if i > 0:
@@ -999,14 +1047,24 @@ def cmd_sync():
                 nd = {"error": "unexpected response", "inbounds": []}
             node_details[host] = nd
             print(format_query_result(host, nd))
+            if nd.get("error"):
+                failures.append(host)
         except Exception as e:
             print(f"  [{host}] ❌ Query failed: {e}")
+            failures.append(host)
+
+    if failures:
+        print(
+            "❌ Subscription sync aborted; existing production artifacts were kept. "
+            f"Failed nodes: {', '.join(failures)}"
+        )
+        return False
 
     yaml_content = generate_subscription(cfg, node_details)
     vless_content = generate_vless_subscription(cfg, node_details)
     if not yaml_content:
         print("❌ No subscription content generated.")
-        return
+        return False
 
     proxy_count = yaml_content.count("type: vless")
     print(f"\nGenerated subscription with {proxy_count} nodes")
@@ -1016,14 +1074,15 @@ def cmd_sync():
     yaml_result = upload_subscription_file(sub, "config.yaml", yaml_content)
     if yaml_result.returncode != 0:
         print(f"❌ config.yaml upload failed: {yaml_result.stderr}")
-        return
+        return False
     vless_result = upload_subscription_file(sub, "vless.txt", vless_content)
     if vless_result.returncode != 0:
         print(f"❌ vless.txt upload failed: {vless_result.stderr}")
-        return
+        return False
     print(f"✅ Uploaded config.yaml and vless.txt to {sub['ssh_host']}:{sub['file_path']}")
     print(f"📋 Clash/Mihomo: {subscription_url(cfg, 'config.yaml')}")
     print(f"   Loon/V2rayN: {subscription_url(cfg, 'vless.txt')}")
+    return True
 
 # ── Main ─────────────────────────────────────────────────────
 

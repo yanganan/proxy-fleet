@@ -21,7 +21,7 @@
 
 ```bash
 # 1. 克隆
-git clone https://github.com/oaker-io/proxy-fleet.git
+git clone https://github.com/yanganan/proxy-fleet.git
 cd proxy-fleet
 
 # 2. 交互式初始化 — 生成 config.json
